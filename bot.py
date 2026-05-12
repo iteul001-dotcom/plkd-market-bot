@@ -37,12 +37,32 @@ if not config.discord_token:
     raise RuntimeError("Brak DISCORD_TOKEN w .env")
 
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.message_content = True
+
 db = Database(config.database_path)
 futbin = FutbinClient(config.futbin_request_timeout_seconds, config.futbin_max_retries, logger)
 service = TrackerService(db, futbin, config, logger)
 
-_synced = False
+
+class TradePilotBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        await db.init()
+
+        if config.discord_guild_id:
+            guild_obj = discord.Object(id=int(config.discord_guild_id))
+            self.tree.clear_commands(guild=guild_obj)
+            self.tree.copy_global_to(guild=guild_obj)
+            synced = await self.tree.sync(guild=guild_obj)
+            logger.info("Synced %s guild commands: %s", len(synced), [c.name for c in synced])
+        else:
+            synced = await self.tree.sync()
+            logger.info("Synced %s global commands: %s", len(synced), [c.name for c in synced])
+
+        if not tracking_loop.is_running():
+            tracking_loop.start()
+
+
+bot = TradePilotBot(command_prefix="!", intents=intents)
 
 
 async def send_embed_to_alert_target(embed: discord.Embed) -> None:
@@ -82,22 +102,6 @@ async def send_market_summary(title: str, rows: list[str]) -> None:
 
 @bot.event
 async def on_ready() -> None:
-    global _synced
-
-    await db.init()
-    if not _synced:
-        if config.discord_guild_id:
-            guild_obj = discord.Object(id=int(config.discord_guild_id))
-            await bot.tree.sync(guild=guild_obj)
-            logger.info("Slash commands synced for guild %s", config.discord_guild_id)
-        else:
-            await bot.tree.sync()
-            logger.info("Global slash commands synced")
-        _synced = True
-
-    if not tracking_loop.is_running():
-        tracking_loop.start()
-
     logger.info("Bot online as %s", bot.user)
 
 
@@ -130,7 +134,7 @@ async def price_command(interaction: discord.Interaction, player: str) -> None:
         embed.add_field(name="7d", value=f"{trend['change7d']:.2f}%", inline=True)
         embed.add_field(name="Trend", value=trend["trend"], inline=True)
         await interaction.followup.send(embed=embed)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         await interaction.followup.send(f"Blad price: {exc}")
 
 
@@ -144,7 +148,7 @@ async def track_command(interaction: discord.Interaction, player: str, threshold
             f"✅ Dodano: {found['name']} (ID {found['id']}) | threshold: {threshold or config.alert_threshold_percent}%",
             ephemeral=True,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         await interaction.followup.send(f"Blad track: {exc}", ephemeral=True)
 
 
@@ -184,6 +188,16 @@ async def topfallers_command(interaction: discord.Interaction) -> None:
     rows = await service.top_movers("fallers", 10)
     lines = [f"{i+1}. {r['player_name']}: {r['pct']:.2f}%" for i, r in enumerate(rows)]
     await interaction.response.send_message("\n".join(lines) if lines else "Za malo danych", ephemeral=True)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    logger.exception("App command error: %s", error)
+    msg = "Wystapil blad komendy. Sprawdz logi bota."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
 
 
 if __name__ == "__main__":
